@@ -131,14 +131,24 @@ static void GBAInit(void* cpu, struct mCPUComponent* component) {
 	gba->irqEvent.priority = 0;
 }
 
+static size_t _romBufferSize(const struct GBA* gba) {
+	if (gba->memory.romSize > SIZE_CART0 || gba->yankedRomSize > SIZE_CART0) {
+		return GBA_SIZE_CART_EXTENDED_BUFFER;
+	}
+	return SIZE_CART0;
+}
+
 void GBAUnloadROM(struct GBA* gba) {
 	GBAMemoryClearAGBPrint(gba);
 	if (gba->memory.rom && !gba->isPristine) {
+		size_t bufferSize = _romBufferSize(gba);
 		if (gba->yankedRomSize) {
 			gba->yankedRomSize = 0;
 		}
 #ifndef FIXED_ROM_BUFFER
-		mappedMemoryFree(gba->memory.rom, SIZE_CART0);
+		mappedMemoryFree(gba->memory.rom, bufferSize);
+#else
+		UNUSED(bufferSize);
 #endif
 	}
 
@@ -419,10 +429,32 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 			gba->memory.rom = anonymousMemoryMap(SIZE_CART0);
 #endif
 		} else {
+#ifndef FIXED_ROM_BUFFER
+			// Extended ROM: one anonymous buffer of GBA_SIZE_CART_EXTENDED_BUFFER, so every fetch window
+			// is backed (untouched pages cost nothing) and frees always use the same size.
+			size_t size = gba->pristineRomSize;
+			if (size > GBA_SIZE_CART_EXTENDED) {
+				mLOG(GBA, WARN, "ROM is larger than the %i MiB ceiling; truncating", M_GBA_ROM_MAX_MB);
+				size = GBA_SIZE_CART_EXTENDED;
+			}
+			gba->isPristine = false;
+			gba->memory.rom = anonymousMemoryMap(GBA_SIZE_CART_EXTENDED_BUFFER);
+			vf->seek(vf, 0, SEEK_SET);
+			if (gba->memory.rom && vf->read(vf, gba->memory.rom, size) != (ssize_t) size) {
+				mappedMemoryFree(gba->memory.rom, GBA_SIZE_CART_EXTENDED_BUFFER);
+				gba->memory.rom = NULL;
+			}
+			gba->memory.romSize = size;
+			gba->pristineRomSize = size;
+#else
 			gba->memory.rom = vf->map(vf, SIZE_CART0, MAP_READ);
 			gba->memory.romSize = SIZE_CART0;
+			gba->pristineRomSize = SIZE_CART0;
+#endif
 		}
-		gba->pristineRomSize = SIZE_CART0;
+		if (gba->memory.romSize <= SIZE_CART0) {
+			gba->pristineRomSize = SIZE_CART0;
+		}
 	} else if (gba->pristineRomSize == 0x00100000) {
 		// 1 MiB ROMs (e.g. Classic NES) all appear as 4x mirrored, but not more
 		gba->isPristine = false;
@@ -448,7 +480,7 @@ bool GBALoadROM(struct GBA* gba, struct VFile* vf) {
 	gba->yankedRomSize = 0;
 	gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
 	gba->romCrc32 = doCrc32(gba->memory.rom, gba->pristineRomSize);
-	if (popcount32(gba->memory.romSize) != 1) {
+	if (popcount32(gba->memory.romSize) != 1 && gba->memory.romSize <= SIZE_CART0) {
 		// This ROM is either a bad dump or homebrew. Emulate flash cart behavior.
 #ifndef FIXED_ROM_BUFFER
 		void* newRom = anonymousMemoryMap(SIZE_CART0);
@@ -519,6 +551,10 @@ void GBALoadBIOS(struct GBA* gba, struct VFile* vf) {
 }
 
 void GBAApplyPatch(struct GBA* gba, struct Patch* patch) {
+	if (gba->memory.romSize > SIZE_CART0) {
+		mLOG(GBA, WARN, "Patches are not supported on extended ROMs");
+		return;
+	}
 	size_t patchedSize = patch->outputSize(patch, gba->memory.romSize);
 	if (!patchedSize || patchedSize > SIZE_CART0) {
 		return;

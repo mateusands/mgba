@@ -231,6 +231,33 @@ static void _analyzeForIdleLoop(struct GBA* gba, struct ARMCore* cpu, uint32_t a
 	}
 }
 
+// Points the CPU's fetch window at the ROM bytes behind a cart address. Sequential fetches apply the
+// mask with no region check, so the window must be linear across every 16 MiB boundary code can run
+// through. Stock ROMs keep one mask over the 32 MiB buffer. Extended ROMs use one mask per window:
+// for window A, address & 0x07FFFFFF == address - BASE_CART0; for window B+, address & 0x0FFFFFFF
+// runs 0x02000000-0x0DFFFFFF, so the base sits 32 MiB before the window's first byte (still inside
+// the buffer, which starts with window A).
+static bool _setCartActiveRegion(struct GBAMemory* memory, struct ARMCore* cpu, uint32_t address) {
+	if (memory->romSize <= SIZE_CART0) {
+		cpu->memory.activeRegion = memory->rom;
+		cpu->memory.activeMask = memory->romMask;
+		return (address & (SIZE_CART0 - 1)) < memory->romSize;
+	}
+	size_t offset = GBACartOffset(memory, address);
+	if (offset >= memory->romSize) {
+		return false;
+	}
+	if ((address >> BASE_OFFSET) <= REGION_CART2_EX) {
+		cpu->memory.activeRegion = memory->rom;
+		cpu->memory.activeMask = 0x07FFFFFF;
+	} else {
+		size_t windowStart = offset - ((address & 0x0FFFFFFF) - 0x02000000);
+		cpu->memory.activeRegion = (uint32_t*) ((uint8_t*) memory->rom + windowStart - 0x02000000);
+		cpu->memory.activeMask = 0x0FFFFFFF;
+	}
+	return true;
+}
+
 static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 	struct GBA* gba = (struct GBA*) cpu->master;
 	struct GBAMemory* memory = &gba->memory;
@@ -277,7 +304,7 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 		} else {
 			cpu->memory.activeMask &= -WORD_SIZE_ARM;
 		}
-		if (newRegion < REGION_CART0 || (address & (SIZE_CART0 - 1)) < memory->romSize) {
+		if (newRegion < REGION_CART0 || GBACartOffset(memory, address) < memory->romSize) {
 			return;
 		}
 	}
@@ -322,9 +349,7 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 	case REGION_CART1_EX:
 	case REGION_CART2:
 	case REGION_CART2_EX:
-		cpu->memory.activeRegion = memory->rom;
-		cpu->memory.activeMask = memory->romMask;
-		if ((address & (SIZE_CART0 - 1)) < memory->romSize) {
+		if (_setCartActiveRegion(memory, cpu, address)) {
 			break;
 		}
 		if ((address & 0x00FFFFFE) == AGB_PRINT_FLUSH_ADDR && memory->agbPrintProtect == 0x20) {
@@ -334,6 +359,9 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 		}
 	// Fall through
 	default:
+		if (GBAIsExtendedCartAddress(memory, address) && _setCartActiveRegion(memory, cpu, address)) {
+			break;
+		}
 		memory->activeRegion = -1;
 		cpu->memory.activeRegion = (uint32_t*) _deadbeef;
 		cpu->memory.activeMask = 0;
@@ -409,8 +437,8 @@ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
 
 #define LOAD_CART \
 	wait += waitstatesRegion[address >> BASE_OFFSET]; \
-	if ((address & (SIZE_CART0 - 1)) < memory->romSize) { \
-		LOAD_32(value, address & (SIZE_CART0 - 4), memory->rom); \
+	if (GBACartOffset(memory, address) < memory->romSize) { \
+		LOAD_32(value, GBACartOffset(memory, address) & ~(size_t) 3, memory->rom); \
 	} else if (memory->vfame.cartType) { \
 		value = GBAVFameGetPatternValue(address, 32); \
 	} else { \
@@ -500,6 +528,10 @@ uint32_t GBALoad32(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		LOAD_SRAM;
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(memory, address)) {
+			LOAD_CART;
+			break;
+		}
 		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load32: 0x%08X", address);
 		LOAD_BAD;
 		break;
@@ -574,8 +606,8 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	case REGION_CART1_EX:
 	case REGION_CART2:
 		wait = memory->waitstatesNonseq16[address >> BASE_OFFSET];
-		if ((address & (SIZE_CART0 - 1)) < memory->romSize) {
-			LOAD_16(value, address & (SIZE_CART0 - 2), memory->rom);
+		if (GBACartOffset(memory, address) < memory->romSize) {
+			LOAD_16(value, GBACartOffset(memory, address) & ~(size_t) 1, memory->rom);
 		} else if (memory->vfame.cartType) {
 			value = GBAVFameGetPatternValue(address, 16);
 		} else if ((address & (SIZE_CART0 - 1)) >= AGB_PRINT_BASE) {
@@ -599,8 +631,8 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 			value = GBASavedataReadEEPROM(&memory->savedata);
 		} else if ((address & 0x0DFC0000) >= 0x0DF80000 && memory->hw.devices & HW_EREADER) {
 			value = GBACartEReaderRead(&memory->ereader, address);
-		} else if ((address & (SIZE_CART0 - 1)) < memory->romSize) {
-			LOAD_16(value, address & (SIZE_CART0 - 2), memory->rom);
+		} else if (GBACartOffset(memory, address) < memory->romSize) {
+			LOAD_16(value, GBACartOffset(memory, address) & ~(size_t) 1, memory->rom);
 		} else if (memory->vfame.cartType) {
 			value = GBAVFameGetPatternValue(address, 16);
 		} else {
@@ -615,6 +647,16 @@ uint32_t GBALoad16(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		value |= value << 8;
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(memory, address)) {
+			wait = memory->waitstatesNonseq16[address >> BASE_OFFSET];
+			if (GBACartOffset(memory, address) < memory->romSize) {
+				LOAD_16(value, GBACartOffset(memory, address) & ~(size_t) 1, memory->rom);
+			} else {
+				mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load16: 0x%08X", address);
+				value = (address >> 1) & 0xFFFF;
+			}
+			break;
+		}
 		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load16: 0x%08X", address);
 		value = (GBALoadBad(cpu) >> ((address & 2) * 8)) & 0xFFFF;
 		break;
@@ -690,8 +732,8 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 	case REGION_CART2:
 	case REGION_CART2_EX:
 		wait = memory->waitstatesNonseq16[address >> BASE_OFFSET];
-		if ((address & (SIZE_CART0 - 1)) < memory->romSize) {
-			value = ((uint8_t*) memory->rom)[address & (SIZE_CART0 - 1)];
+		if (GBACartOffset(memory, address) < memory->romSize) {
+			value = ((uint8_t*) memory->rom)[GBACartOffset(memory, address)];
 		} else if (memory->vfame.cartType) {
 			value = GBAVFameGetPatternValue(address, 8);
 		} else {
@@ -726,6 +768,16 @@ uint32_t GBALoad8(struct ARMCore* cpu, uint32_t address, int* cycleCounter) {
 		value &= 0xFF;
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(memory, address)) {
+			wait = memory->waitstatesNonseq16[address >> BASE_OFFSET];
+			if (GBACartOffset(memory, address) < memory->romSize) {
+				value = ((uint8_t*) memory->rom)[GBACartOffset(memory, address)];
+			} else {
+				mLOG(GBA_MEM, GAME_ERROR, "Out of bounds ROM Load8: 0x%08X", address);
+				value = ((address >> 1) >> ((address & 1) * 8)) & 0xFF;
+			}
+			break;
+		}
 		mLOG(GBA_MEM, GAME_ERROR, "Bad memory Load8: 0x%08x", address);
 		value = (GBALoadBad(cpu) >> ((address & 3) * 8)) & 0xFF;
 		break;
@@ -1128,6 +1180,9 @@ uint32_t GBAView32(struct ARMCore* cpu, uint32_t address) {
 		value |= GBALoad8(cpu, address + 3, 0) << 24;
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(&gba->memory, address)) {
+			value = GBALoad32(cpu, address, 0);
+		}
 		break;
 	}
 	return value;
@@ -1169,6 +1224,9 @@ uint16_t GBAView16(struct ARMCore* cpu, uint32_t address) {
 		value |= GBALoad8(cpu, address + 1, 0) << 8;
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(&gba->memory, address)) {
+			value = GBALoad16(cpu, address, 0);
+		}
 		break;
 	}
 	return value;
@@ -1201,13 +1259,57 @@ uint8_t GBAView8(struct ARMCore* cpu, uint32_t address) {
 		value = GBAView16(cpu, address) >> ((address & 1) * 8);
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(&gba->memory, address)) {
+			value = GBALoad8(cpu, address, 0);
+		}
 		break;
 	}
 	return value;
 }
 
+// Debugger/cheat writes into an extended ROM. The buffer is sized for the ceiling, not the file, so
+// unlike stock ROMs an extended ROM never grows: writes past its end are dropped.
+static bool _patchExtendedCart(struct GBA* gba, uint32_t address, int width, int32_t value, int32_t* old) {
+	struct GBAMemory* memory = &gba->memory;
+	if (memory->romSize <= SIZE_CART0) {
+		return false;
+	}
+	uint32_t region = address >> BASE_OFFSET;
+	if (!(region >= REGION_CART0 && region <= REGION_CART2_EX) && !GBAIsExtendedCartRegion(region)) {
+		return false;
+	}
+	size_t offset = GBACartOffset(memory, address) & ~(size_t) (width - 1);
+	int32_t oldValue = -1;
+	if (offset + width <= memory->romSize) {
+		switch (width) {
+		case 4:
+			LOAD_32(oldValue, offset, memory->rom);
+			STORE_32(value, offset, memory->rom);
+			break;
+		case 2:
+			LOAD_16(oldValue, offset, memory->rom);
+			STORE_16(value, offset, memory->rom);
+			oldValue = (int16_t) oldValue;
+			break;
+		default:
+			oldValue = ((int8_t*) memory->rom)[offset];
+			((int8_t*) memory->rom)[offset] = value;
+			break;
+		}
+	} else {
+		mLOG(GBA_MEM, WARN, "Patch past the end of an extended ROM: 0x%08X", address);
+	}
+	if (old) {
+		*old = oldValue;
+	}
+	return true;
+}
+
 void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* old) {
 	struct GBA* gba = (struct GBA*) cpu->master;
+	if (_patchExtendedCart(gba, address, 4, value, old)) {
+		return;
+	}
 	struct GBAMemory* memory = &gba->memory;
 	int32_t oldValue = -1;
 
@@ -1282,6 +1384,13 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
 
 void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* old) {
 	struct GBA* gba = (struct GBA*) cpu->master;
+	int32_t extendedOld;
+	if (_patchExtendedCart(gba, address, 2, value, &extendedOld)) {
+		if (old) {
+			*old = extendedOld;
+		}
+		return;
+	}
 	struct GBAMemory* memory = &gba->memory;
 	int16_t oldValue = -1;
 
@@ -1352,6 +1461,13 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
 
 void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old) {
 	struct GBA* gba = (struct GBA*) cpu->master;
+	int32_t extendedOld;
+	if (_patchExtendedCart(gba, address, 1, value, &extendedOld)) {
+		if (old) {
+			*old = extendedOld;
+		}
+		return;
+	}
 	struct GBAMemory* memory = &gba->memory;
 	int8_t oldValue = -1;
 
@@ -1463,7 +1579,7 @@ uint32_t GBALoadMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum L
 
 	uint32_t addressMisalign = address & 0x3;
 	int region = address >> BASE_OFFSET;
-	if (region < REGION_CART_SRAM) {
+	if (region < REGION_CART_SRAM || GBAIsExtendedCartAddress(memory, address)) {
 		address &= 0xFFFFFFFC;
 	}
 	int wait = memory->waitstatesSeq32[region] - memory->waitstatesNonseq32[region];
@@ -1503,6 +1619,10 @@ uint32_t GBALoadMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum L
 		LDM_LOOP(LOAD_SRAM);
 		break;
 	default:
+		if (GBAIsExtendedCartAddress(memory, address)) {
+			LDM_LOOP(LOAD_CART);
+			break;
+		}
 		LDM_LOOP(LOAD_BAD);
 		break;
 	}
@@ -1676,6 +1796,17 @@ void GBAAdjustWaitstates(struct GBA* gba, uint16_t parameters) {
 	memory->waitstatesSeq32[REGION_CART0] = memory->waitstatesSeq32[REGION_CART0_EX] = 2 * memory->waitstatesSeq16[REGION_CART0] + 1;
 	memory->waitstatesSeq32[REGION_CART1] = memory->waitstatesSeq32[REGION_CART1_EX] = 2 * memory->waitstatesSeq16[REGION_CART1] + 1;
 	memory->waitstatesSeq32[REGION_CART2] = memory->waitstatesSeq32[REGION_CART2_EX] = 2 * memory->waitstatesSeq16[REGION_CART2] + 1;
+
+	// Extended-ROM regions have no WAITCNT field of their own; they read at WS0 timings.
+	int region;
+	for (region = 0x10; region < 0xF0; ++region) {
+		if (GBAIsExtendedCartRegion(region)) {
+			memory->waitstatesNonseq16[region] = memory->waitstatesNonseq16[REGION_CART0];
+			memory->waitstatesSeq16[region] = memory->waitstatesSeq16[REGION_CART0];
+			memory->waitstatesNonseq32[region] = memory->waitstatesNonseq32[REGION_CART0];
+			memory->waitstatesSeq32[region] = memory->waitstatesSeq32[REGION_CART0];
+		}
+	}
 
 	memory->prefetch = prefetch;
 

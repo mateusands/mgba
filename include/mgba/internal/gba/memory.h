@@ -82,6 +82,28 @@ enum {
 	BASE_OFFSET = 24
 };
 
+/* Extended ROM (mateusands fork): a ROM file larger than 32 MiB that is not a Matrix cart is mapped
+ * linearly instead of being truncated. The first 96 MiB fill 0x08000000-0x0DFFFFFF (window A, the
+ * address range the cartridge bus already decodes); the rest fills fork-only 16 MiB regions whose low
+ * nibble is 2-D (0x12-0x1D, 0x22-0x2D, ...), so BIOS source checks against 0x0E000000 still pass.
+ * ROMs of 32 MiB or less keep stock mirroring exactly. */
+#ifndef M_GBA_ROM_MAX_MB
+#define M_GBA_ROM_MAX_MB 288
+#endif
+#define GBA_SIZE_CART_EXTENDED ((size_t) M_GBA_ROM_MAX_MB << 20)
+#define GBA_SIZE_CART_WINDOW_A 0x06000000u
+#define GBA_CART_EXT_WINDOW_REGIONS 12
+#define GBA_SIZE_CART_EXT_WINDOW ((size_t) GBA_CART_EXT_WINDOW_REGIONS << 24)
+/* Instruction fetch uses one mask per window (0x07FFFFFF for A, 0x0FFFFFFF for B+), so code running
+ * past a window's last region reads up to 32 MiB beyond it. The buffer covers the ceiling rounded up
+ * to a whole window plus that slack; untouched pages of an anonymous map cost nothing. */
+#define GBA_SIZE_CART_EXTENDED_BUFFER (GBA_SIZE_CART_WINDOW_A + 0x02000000u + \
+	((GBA_SIZE_CART_EXTENDED - GBA_SIZE_CART_WINDOW_A + GBA_SIZE_CART_EXT_WINDOW - 1) / GBA_SIZE_CART_EXT_WINDOW) * GBA_SIZE_CART_EXT_WINDOW)
+
+static inline bool GBAIsExtendedCartRegion(uint32_t region) {
+	return region >= 0x10 && region < 0xF0 && (region & 0xF) >= 0x2 && (region & 0xF) <= 0xD;
+}
+
 enum {
 	AGB_PRINT_BASE = 0x00FD0000,
 	AGB_PRINT_TOP = 0x00FE0000,
@@ -141,6 +163,32 @@ struct GBAMemory {
 
 	bool mirroring;
 };
+
+static_assert(M_GBA_ROM_MAX_MB % 16 == 0 && M_GBA_ROM_MAX_MB >= 96 && M_GBA_ROM_MAX_MB <= 96 + 14 * 192,
+	"M_GBA_ROM_MAX_MB must be a multiple of 16 between 96 and 2784");
+
+/* The one place a cartridge address becomes a ROM offset. Stock ROMs fold every cart region onto
+ * 32 MiB as before; extended ROMs map linearly. Addresses outside any window return SIZE_MAX, which
+ * no ROM size reaches, so callers' `< romSize` checks fall through to open bus. */
+static inline size_t GBACartOffset(const struct GBAMemory* memory, uint32_t address) {
+	if (memory->romSize <= SIZE_CART0) {
+		return address & (SIZE_CART0 - 1);
+	}
+	uint32_t region = address >> BASE_OFFSET;
+	if (region >= REGION_CART0 && region <= REGION_CART2_EX) {
+		return address - BASE_CART0;
+	}
+	if (GBAIsExtendedCartRegion(region)) {
+		size_t window = (region >> 4) - 1;
+		size_t slot = (region & 0xF) - 0x2;
+		return GBA_SIZE_CART_WINDOW_A + ((window * GBA_CART_EXT_WINDOW_REGIONS + slot) << BASE_OFFSET) + (address & OFFSET_MASK);
+	}
+	return SIZE_MAX;
+}
+
+static inline bool GBAIsExtendedCartAddress(const struct GBAMemory* memory, uint32_t address) {
+	return memory->romSize > SIZE_CART0 && GBAIsExtendedCartRegion(address >> BASE_OFFSET);
+}
 
 struct GBA;
 void GBAMemoryInit(struct GBA* gba);

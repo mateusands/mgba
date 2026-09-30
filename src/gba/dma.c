@@ -32,8 +32,9 @@ void GBADMAReset(struct GBA* gba) {
 	gba->memory.dma[3].count = 0x10000;
 	gba->memory.activeDMA = -1;
 }
-static bool _isValidDMASAD(int dma, uint32_t address) {
-	if (dma == 0 && address >= BASE_CART0 && address < BASE_CART_SRAM) {
+static bool _isValidDMASAD(const struct GBAMemory* memory, int dma, uint32_t address) {
+	bool cart = (address >= BASE_CART0 && address < BASE_CART_SRAM) || GBAIsExtendedCartAddress(memory, address);
+	if (dma == 0 && cart) {
 		return false;
 	}
 	return address >= BASE_WORKING_RAM;
@@ -45,8 +46,10 @@ static bool _isValidDMADAD(int dma, uint32_t address) {
 
 uint32_t GBADMAWriteSAD(struct GBA* gba, int dma, uint32_t address) {
 	struct GBAMemory* memory = &gba->memory;
-	if (_isValidDMASAD(dma, address)) {
-		memory->dma[dma].source = address & 0x0FFFFFFE;
+	if (_isValidDMASAD(memory, dma, address)) {
+		// The bus has 28 address lines; an extended ROM keeps the upper bits so it can reach its own
+		// fork-only regions.
+		memory->dma[dma].source = address & (GBAIsExtendedCartAddress(memory, address) ? 0xFFFFFFFE : 0x0FFFFFFE);
 	} else {
 		mLOG(GBA_DMA, GAME_ERROR, "Invalid DMA source address: 0x%08X", address);
 		memory->dma[dma].source = 0;
@@ -298,7 +301,7 @@ void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
 	}
 
 	int sourceOffset;
-	if (info->nextSource >= BASE_CART0 && info->nextSource < BASE_CART_SRAM && GBADMARegisterGetSrcControl(info->reg) < 3) {
+	if (((info->nextSource >= BASE_CART0 && info->nextSource < BASE_CART_SRAM) || GBAIsExtendedCartAddress(memory, info->nextSource)) && GBADMARegisterGetSrcControl(info->reg) < 3) {
 		sourceOffset = width;
 	} else {
 		sourceOffset = DMA_OFFSET[GBADMARegisterGetSrcControl(info->reg)] * width;
